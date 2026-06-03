@@ -95,42 +95,49 @@ def create_spark_session() -> SparkSession:
 # ─────────────────────────────────────────────────────────────
 
 def read_kafka_stream(spark: SparkSession):
-    """
-    Lit le topic Kafka `listening_events` en streaming.
-
-    TODO :
-        1. Utiliser spark.readStream.format("kafka")
-        2. Configurer kafka.bootstrap.servers, subscribe, startingOffsets
-        3. Caster la colonne "value" (bytes) en string
-        4. Parser le JSON avec from_json() et LISTENING_EVENT_SCHEMA
-        5. Caster la colonne "timestamp" (string ISO) en TimestampType
-        6. Renommer en "event_time" pour les fenêtres temporelles
-
-    Returns:
-        DataFrame streaming avec colonnes typées
-    """
-    raise NotImplementedError("TODO : implémenter read_kafka_stream()")
-
+    raw_df = (
+        spark.readStream
+        .format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+        .option("subscribe", KAFKA_TOPIC)
+        .option("startingOffsets", "latest")
+        .load()
+    )
+    parsed_df = (
+        raw_df
+        .select(F.from_json(F.col("value").cast("string"), LISTENING_EVENT_SCHEMA).alias("data"))
+        .select("data.*")
+        .withColumn("event_time", F.to_timestamp("timestamp"))
+    )
+    return parsed_df
 
 # ─────────────────────────────────────────────────────────────
 # AGRÉGATIONS STREAMING
 # ─────────────────────────────────────────────────────────────
 
 def compute_top_tracks_tumbling(events_df):
-    """
-    Top 10 des tracks par tumbling window de 5 minutes.
-
-    TODO :
-        1. groupBy(window("event_time", "5 minutes"), "track_id")
-        2. agg(count("*").alias("stream_count"), countDistinct("user_id").alias("unique_listeners"))
-        3. Output mode : "update" (on met à jour au fur et à mesure)
-        4. Écrire dans PostgreSQL table realtime_top_tracks
-
-    Hint : pour écrire dans PostgreSQL depuis Spark Streaming,
-    utiliser foreachBatch() et df.write.jdbc() dans le batch.
-    """
-    raise NotImplementedError("TODO : implémenter compute_top_tracks_tumbling()")
-
+    windowed = (
+        events_df
+        .groupBy(F.window("event_time", "5 minutes"), "track_id")
+        .agg(
+            F.count("*").alias("stream_count"),
+            F.approx_count_distinct("user_id").alias("unique_listeners") 
+        )
+    )
+    def write_batch(batch_df, batch_id):
+        batch_df.write.jdbc(
+            url=POSTGRES_URL,
+            table="realtime_top_tracks",
+            mode="append",
+            properties=POSTGRES_PROPS
+        )
+    return (
+        windowed.writeStream
+        .outputMode("update")
+        .foreachBatch(write_batch)
+        .option("checkpointLocation", CHECKPOINT_PATH + "/top_tracks")
+        .start()
+    )
 
 def compute_genre_listeners_sliding(events_df, catalog_df):
     """
