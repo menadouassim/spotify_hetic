@@ -17,6 +17,7 @@ TODO Phase 2 :  Activer _publish_to_kafka() et le mode fraude
 import argparse
 import json
 import logging
+import os
 import random
 import signal
 import time
@@ -40,7 +41,7 @@ logger = logging.getLogger("p2p_simulator")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-REDIS_URL = "redis://localhost:6379/1"
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/1")
 KAFKA_BOOTSTRAP = "kafka-1:9092"
 
 TOPICS = {
@@ -78,10 +79,39 @@ class P2PSimulator:
 
         self.active_peers = [str(uuid.uuid4()) for _ in range(n_peers)]
 
+        # Charge les vrais track_id depuis PostgreSQL (sinon garde SAMPLE_TRACKS)
+        self._load_catalog()
+
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
 
         logger.info(f"Simulateur démarré | mode={mode} | peers={n_peers} | rate={events_per_second} evt/s")
+
+    def _load_catalog(self):
+        """Charge les vrais track_id depuis PostgreSQL (sinon garde SAMPLE_TRACKS)."""
+        global SAMPLE_TRACKS
+        try:
+            import psycopg2
+            dsn = os.getenv("SPOTIFY_POSTGRES_CONN")
+            if dsn:
+                conn = psycopg2.connect(dsn.replace("postgresql+psycopg2://", "postgresql://"))
+            else:
+                conn = psycopg2.connect(
+                    host=os.getenv("POSTGRES_HOST", "localhost"),
+                    port=os.getenv("POSTGRES_PORT", "5432"),
+                    dbname=os.getenv("POSTGRES_DB", "spotify"),
+                    user=os.getenv("POSTGRES_USER", "spotify"),
+                    password=os.getenv("POSTGRES_PASSWORD", "spotify"),
+                )
+            cur = conn.cursor()
+            cur.execute("SELECT id, duration_ms FROM tracks LIMIT 500")
+            rows = cur.fetchall()
+            conn.close()
+            if rows:
+                SAMPLE_TRACKS = [{"id": str(r[0]), "duration_ms": r[1] or 240000} for r in rows]
+                logger.info(f"Catalogue chargé depuis PostgreSQL : {len(SAMPLE_TRACKS)} tracks")
+        except Exception as e:
+            logger.warning(f"Catalogue PostgreSQL non chargé ({e}) — tracks d'exemple utilisés")
 
     def run(self):
         interval = 1.0 / self.events_per_second
@@ -166,7 +196,9 @@ class P2PSimulator:
 
     def _publish_to_redis(self, channel: str, payload: str):
         try:
-            self.redis.publish(channel, payload)
+            self.redis.publish(channel, payload)                 # temps réel (pub/sub)
+            self.redis.lpush(f"queue:{channel}", payload)        # file persistante pour Airflow
+            self.redis.ltrim(f"queue:{channel}", 0, 99999)       # garde au max 100k events
         except Exception as e:
             logger.error(f"Redis error: {e}")
 

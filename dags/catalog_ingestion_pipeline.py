@@ -34,6 +34,18 @@ LABEL_FILES = [
     "urban_pulse.json"
 ]
 
+DAG_DOC = """
+## catalog_ingestion_pipeline
+
+Ingère le catalogue musical (artists / albums / tracks) depuis les fichiers JSON
+des 3 labels stockés dans MinIO (`labels-raw`) vers PostgreSQL.
+
+- **Source** : MinIO bucket `labels-raw` (sunset_records / nightwave_music / urban_pulse).
+- **Étapes** : extract_from_minio → validate_schema (invalides → DLQ) → transform_catalog
+  (normalisation, dédoublonnage) → load_to_postgres (upsert idempotent).
+- **Idempotence** : `ON CONFLICT` sur artists (name,label), albums (id), tracks (id).
+"""
+
 DEFAULT_ARGS = {
     "owner": "spotify-team",
     "depends_on_past": False,
@@ -53,6 +65,7 @@ with DAG(
     catchup=True,
     max_active_runs=1,
     tags=["spotify", "ingestion", "catalog"],
+    doc_md=DAG_DOC,
 ) as dag:
 
     # ─────────────────────────────
