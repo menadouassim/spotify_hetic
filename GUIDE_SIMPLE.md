@@ -569,3 +569,131 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT (SELECT count
 🎉 **Phase 1 (#1 → #10) terminée et testée.**
 
 ---
+
+# 🛠️ PHASE 2 — PROCÉDURE COMPLÈTE (Kafka + Spark, issues #11 → #20)
+
+> ⚠️ **Mémoire** : Kafka (3 brokers) + Spark + Airflow, c'est lourd (~6–8 Go RAM Docker).
+> Si ça rame ou plante, libère de la RAM en coupant temporairement Airflow :
+> `docker compose stop airflow-webserver airflow-worker airflow-scheduler airflow-triggerer`
+> (et rallume-les plus tard avec `docker compose start ...`).
+
+## ÉTAPE 10 (#11) — Cluster Kafka KRaft ✅ (testé)
+
+Les services Kafka (`kafka-1/2/3`, `kafka-ui`, `kafka-init`) sont dans `docker-compose.yml`.
+**3 pièges classiques** (déjà corrigés dans ce repo — à vérifier si tu repars d'un skeleton) :
+
+1. **Déclarer les volumes** : en bas de `docker-compose.yml`, la section `volumes:` doit contenir
+   `kafka-1-data:`, `kafka-2-data:`, `kafka-3-data:` (sinon `docker compose` est invalide).
+2. **Ports du quorum** : les 3 brokers doivent avoir **le même**
+   `KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9095,3@kafka-3:9097`
+   (ports controller 9093 / 9095 / 9097).
+3. **CLUSTER_ID valide** : la variable s'appelle `CLUSTER_ID` (pas `KAFKA_CLUSTER_ID`) et doit être
+   un **vrai UUID base64** (22 caractères), identique sur les 3 brokers. Pour en générer un :
+   ```bash
+   docker compose run --rm --no-deps --entrypoint kafka-storage kafka-1 random-uuid
+   ```
+   Mets la valeur obtenue dans `CLUSTER_ID:` des 3 brokers.
+
+**Lancer le cluster :**
+```bash
+docker compose up -d kafka-1 kafka-2 kafka-3 kafka-init kafka-ui
+```
+⏳ Attends ~30 s (kafka-init crée les topics). **Vérifier :**
+```bash
+docker compose exec kafka-1 kafka-topics --list --bootstrap-server kafka-1:9092
+```
+✅ Bon = tu vois 6 topics : `listening_events`, `p2p_network_events`, `catalog_updates`,
+`enriched_events`, `fraud_alerts`, `late_listening_events`.
+Et l'UI **http://localhost:8090** → onglet Topics s'affiche (plus de page blanche).
+
+> 🐛 **Page blanche dans Kafka UI ?** = un ou plusieurs brokers sont morts. Vérifie :
+> `docker compose ps -a kafka-1 kafka-2 kafka-3` (cherche "Exited"), puis les logs :
+> `docker compose logs kafka-1 | tail -20`. Si tu vois un message sur `CLUSTER_ID`, c'est le piège #3.
+
+**Santé du cluster (réplication) :**
+```bash
+docker compose exec kafka-1 kafka-topics --describe --topic listening_events --bootstrap-server kafka-1:9092
+```
+✅ Bon = `ReplicationFactor: 3` et `Isr: 1,2,3` sur chaque partition.
+
+> ⚙️ **Pré-requis libs** : `confluent-kafka` est dans `_PIP_ADDITIONAL_REQUIREMENTS` (cf. ÉTAPE 0)
+> et la variable `KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9094,kafka-3:9096` est dans le compose.
+> Le code de #12→#15 est **déjà écrit et testé** dans le repo.
+
+## ÉTAPE 11 (#12) — Simulateur → Kafka ✅ (testé)
+
+> Code dans `src/p2p_simulator/simulator.py` : `_publish_to_kafka()` (clé = `user_id`/`peer_id`),
+> appelé dans `_publish_event` en plus de Redis.
+
+```bash
+# produit ~5 s d'événements dans Kafka, puis vérifie le topic
+docker compose exec airflow-worker python -m p2p_simulator.simulator --peers 6 --rate 80 &
+sleep 6; docker compose exec airflow-worker pkill -f p2p_simulator || true
+docker compose exec kafka-1 kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka-1:9092 --topic listening_events
+```
+✅ Bon = le total de messages du topic `listening_events` augmente.
+(Ou regarde le topic dans Kafka UI http://localhost:8090.)
+
+## ÉTAPE 12 (#13) — Premier job Spark (console) ✅ (testé)
+
+> Fichier `spark_jobs/kafka_console_job.py` — lit `listening_events` et l'affiche.
+
+```bash
+docker compose exec spark-master /opt/spark/bin/spark-submit \
+  --conf spark.jars.ivy=/tmp/ivy \
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+  /opt/spark-jobs/kafka_console_job.py
+```
+✅ Bon = un tableau d'événements s'affiche (`Batch: 0`, colonnes user_id/track_id/…).
+> 💡 **Pièges Spark** (déjà gérés) : utiliser le chemin **absolu** `/opt/spark/bin/spark-submit`,
+> et ajouter **`--conf spark.jars.ivy=/tmp/ivy`** (sinon erreur Ivy `.ivy2 No such file`).
+
+## ÉTAPE 13 (#14) — streaming_trends_job (fenêtres 5 min) ✅ (testé)
+
+> Fichier `spark_jobs/streaming_trends_job.py` — fenêtres tumbling 5 min → table `realtime_top_tracks`
+> (top 10 par fenêtre, upsert idempotent), checkpoint local `/tmp/chk`.
+
+```bash
+# 1) produire des événements (cf. ÉTAPE 11)
+# 2) lancer le job (le trigger availableNow traite l'existant puis s'arrête)
+docker compose exec spark-master bash -c '
+rm -rf /tmp/chk/streaming_trends
+/opt/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/ivy \
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.1 \
+  /opt/spark-jobs/streaming_trends_job.py'
+docker compose exec postgres psql -U spotify -d spotify -c "SELECT count(*), count(DISTINCT window_start) FROM realtime_top_tracks;"
+```
+✅ Bon = `realtime_top_tracks` se remplit (≈ 10 lignes par fenêtre de 5 min).
+
+## ÉTAPE 14 (#15) — Watermarking + late events ✅ (testé)
+
+> Même fichier : `withWatermark("event_time", "10 minutes")` borne l'état ; les events trop en
+> retard (>10 min) sont routés vers le topic Kafka `late_listening_events` (pour le DAG #20).
+
+```bash
+# produire des events EN RETARD puis relancer le job, et vérifier le topic late
+docker compose exec airflow-worker python -c "
+import os; os.environ.setdefault('KAFKA_BOOTSTRAP','kafka-1:9092,kafka-2:9094,kafka-3:9096')
+from datetime import datetime, timezone, timedelta
+from p2p_simulator.simulator import P2PSimulator
+sim=P2PSimulator(n_peers=6, events_per_second=100, mode='normal')
+for _ in range(50):
+    e=sim._generate_listening_event()
+    e['timestamp']=(datetime.now(timezone.utc)-timedelta(minutes=18)).isoformat()
+    sim._publish_event('listening', e)
+sim.kafka.flush(15); print('50 late events produits')
+"
+docker compose exec spark-master bash -c 'rm -rf /tmp/chk/streaming_trends /tmp/chk/late_events; /opt/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/ivy --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.1 /opt/spark-jobs/streaming_trends_job.py'
+docker compose exec kafka-1 kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka-1:9092 --topic late_listening_events
+```
+✅ Bon = le topic `late_listening_events` reçoit les events en retard (≈ 50).
+
+## ÉTAPE 15+ (#16 → #20) — À CODER (pas encore fait)
+
+- **#16** — Exactly-once bout-en-bout (checkpoints + idempotence Kafka/Spark).
+- **#17** — `streaming_enrichment_job` (jointure stream-static catalogue).
+- **#18** — `fraud_detection_job` (stateful, détection bots/free-riders).
+- **#19** — DAG `reconciliation_pipeline` (pont batch ↔ streaming).
+- **#20** — DAG `late_events_reprocessing` (consomme `late_listening_events`).
+
+➡️ Dis-moi **« fais l'issue #16 »** (etc.) et je l'écris + la teste avant de l'ajouter ici.

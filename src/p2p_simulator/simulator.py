@@ -27,8 +27,11 @@ from typing import Optional
 
 import redis
 
-# Phase 2 — décommenter quand Kafka est prêt
-# from confluent_kafka import Producer
+# Phase 2 — producteur Kafka (optionnel : si la lib/le cluster est absent, on continue en Redis)
+try:
+    from confluent_kafka import Producer
+except Exception:
+    Producer = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +45,7 @@ logger = logging.getLogger("p2p_simulator")
 # ─────────────────────────────────────────────────────────────
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/1")
-KAFKA_BOOTSTRAP = "kafka-1:9092"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka-1:9092")
 
 TOPICS = {
     "listening":   "listening_events",
@@ -76,6 +79,15 @@ class P2PSimulator:
         self.event_count = 0
 
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+
+        # Producteur Kafka (Phase 2). Optionnel : si absent, on reste en Redis seul.
+        self.kafka = None
+        if Producer is not None:
+            try:
+                self.kafka = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP, "acks": "all"})
+                logger.info(f"Producteur Kafka connecté : {KAFKA_BOOTSTRAP}")
+            except Exception as e:
+                logger.warning(f"Kafka indisponible ({e}) — publication Kafka désactivée")
 
         self.active_peers = [str(uuid.uuid4()) for _ in range(n_peers)]
 
@@ -202,13 +214,29 @@ class P2PSimulator:
         except Exception as e:
             logger.error(f"Redis error: {e}")
 
+    def _publish_to_kafka(self, topic: str, key: str, payload: str):
+        """Publie dans Kafka (clé = user_id/peer_id → partitionnement)."""
+        if self.kafka is None:
+            return
+        try:
+            self.kafka.produce(topic, key=str(key), value=payload)
+            self.kafka.poll(0)
+        except BufferError:
+            self.kafka.flush(1)
+        except Exception as e:
+            logger.error(f"Kafka produce error: {e}")
+
     def _publish_event(self, topic_key, event):
         payload = json.dumps(event)
         channel = TOPICS[topic_key]
         self._publish_to_redis(channel, payload)
+        key = event.get("user_id") or event.get("peer_id") or event.get("event_id")
+        self._publish_to_kafka(channel, key, payload)
 
     def _shutdown(self, signum, frame):
         self.running = False
+        if self.kafka is not None:
+            self.kafka.flush(5)
         logger.info("Arrêt simulateur")
 
 
