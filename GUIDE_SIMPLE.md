@@ -79,7 +79,23 @@ docker compose exec airflow-worker python /opt/airflow/src/data_generator/genera
 ### ✍️ #4 — DAG catalog_ingestion_pipeline
 👉 Mettre le catalogue dans la base.
 📂 Fichier : `dags/catalog_ingestion_pipeline.py`
-⌨️ Va sur Airflow → lance le DAG **catalog_ingestion_pipeline** (voir recette plus haut).
+
+⌨️ **1) D'abord, envoyer les fichiers JSON générés (#3) dans MinIO** (bucket `labels-raw`).
+Les fichiers sont DANS le conteneur (`/opt/airflow/data/labels/`), pas sur ton Mac — on les
+uploade donc avec boto3 depuis le worker (MinIO est compatible S3) :
+```bash
+docker compose exec -T airflow-worker python -c "
+import boto3, os, glob
+s3 = boto3.client('s3',
+    endpoint_url=os.getenv('MINIO_ENDPOINT'),
+    aws_access_key_id=os.getenv('MINIO_ACCESS_KEY'),
+    aws_secret_access_key=os.getenv('MINIO_SECRET_KEY'))
+for f in sorted(glob.glob('/opt/airflow/data/labels/*.json')):
+    s3.upload_file(f, 'labels-raw', os.path.basename(f)); print('uploaded', os.path.basename(f))
+"
+```
+⌨️ **2) Ensuite**, va sur Airflow → lance le DAG **catalog_ingestion_pipeline** (voir recette plus haut).
+
 ✅ Bon = tout vert + la table `tracks` se remplit :
 ```bash
 docker compose exec postgres psql -U spotify -d spotify -c "SELECT count(*) FROM tracks;"
