@@ -303,7 +303,7 @@ docker compose up -d
 docker compose exec airflow-worker python -c "import faker, boto3, pyarrow, sklearn, redis, pandas; print('LIBS OK')"
 ```
 
-## ÉTAPE 1 (#3) — Générer le catalogue + l'envoyer dans MinIO
+## ÉTAPE #3 — Générer le catalogue + l'envoyer dans MinIO
 
 **a)** Générer les 3 fichiers JSON des labels (dans le conteneur) :
 ```bash
@@ -322,7 +322,7 @@ for f in sorted(glob.glob('/opt/airflow/data/labels/*.json')):
 ```
 ✅ Affiche `uploaded sunset_records.json` etc. (Vérif possible sur http://localhost:9001 → bucket `labels-raw`.)
 
-## ÉTAPE 2 (#4) — Remplir le code du DAG catalog_ingestion_pipeline
+## ÉTAPE #4 (1/2) — Remplir le code du DAG catalog_ingestion_pipeline
 
 Ouvre `dags/catalog_ingestion_pipeline.py`. Il contient **4 fonctions qui finissent par
 `raise NotImplementedError(...)`**. Remplace **chaque fonction entière** (de sa ligne `@task(...)`
@@ -463,7 +463,7 @@ jusqu'à sa ligne `raise NotImplementedError`) par le bloc correspondant ci-dess
 
 Ne touche pas à `notify_success` (déjà rempli) ni à l'ordre des tâches en bas du fichier.
 
-## ÉTAPE 3 (#4) — Lancer et vérifier
+## ÉTAPE #4 (2/2) — Lancer et vérifier
 
 1. Va sur http://localhost:8080 (admin / admin).
 2. Allume **catalog_ingestion_pipeline** (interrupteur bleu) puis clique ▶ (Trigger).
@@ -475,7 +475,7 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT count(*) FROM
 
 ---
 
-## ÉTAPE 4 (#5) — Simulateur P2P
+## ÉTAPE #5 — Simulateur P2P
 
 > Le code des fonctions est **déjà dans `src/p2p_simulator/simulator.py`** (générateurs d'events,
 > `_publish_to_redis` qui pousse aussi dans une **liste Redis** persistante, et `_load_catalog()`
@@ -488,7 +488,7 @@ docker compose exec airflow-worker python -m p2p_simulator.simulator --peers 8 -
 ✅ Bon = logs "Catalogue chargé depuis PostgreSQL : N tracks" puis "Événements publiés : 100, 200…".
 Les events s'accumulent dans Redis (`queue:listening_events`) en attendant le DAG #6.
 
-## ÉTAPE 5 (#6) — DAG streaming_events_pipeline
+## ÉTAPE #6 — DAG streaming_events_pipeline
 
 > Code déjà dans `dags/streaming_events_pipeline.py` (les 5 fonctions :
 > consume_from_redis → validate_events → enrich_events → store_to_parquet → upsert_to_postgres).
@@ -501,7 +501,7 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT count(*) FROM
 ✅ Bon = un nombre > 0 qui monte à chaque run. Un fichier Parquet apparaît aussi dans MinIO
 (`spotify-parquet/listening_events/date=.../hour=.../`).
 
-## ÉTAPE 6 (#7) — DAG aggregation_pipeline
+## ÉTAPE #7 — DAG aggregation_pipeline
 
 > Code déjà dans `dags/aggregation_pipeline.py`. ⚠️ L'`ExternalTaskSensor` est en `soft_fail`
 > + timeout court (10s) : en lancement manuel il "skip" sans bloquer — c'est normal.
@@ -512,7 +512,7 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT (SELECT count
 ```
 ✅ Bon = deux nombres > 0.
 
-## ÉTAPE 7 (#8) — DAG recommendation_pipeline
+## ÉTAPE #8 — DAG recommendation_pipeline
 
 > Code déjà dans `dags/recommendation_pipeline.py` (collaborative filtering, similarité cosinus
 > avec scikit-learn).
@@ -525,7 +525,7 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT count(*) FROM
 ```
 ✅ Bon = un nombre > 0 (aussi stocké dans Redis sous `reco:{user_id}`).
 
-## ÉTAPE 8 (#9) — DAG dlq_reprocessing_pipeline
+## ÉTAPE #9 — DAG dlq_reprocessing_pipeline
 
 > Code déjà dans `dags/dlq_reprocessing_pipeline.py` (fetch → reprocess → update_status).
 
@@ -540,7 +540,7 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT status, count
 ```
 ✅ Bon = le message valide passe en `reprocessed`, le cassé reste `pending` (retry +1, puis `abandoned` après 3 essais).
 
-## ÉTAPE 9 (#10) — Tests pytest
+## ÉTAPE #10 — Tests pytest
 
 > `doc_md` est présent sur les DAGs, et `pytest` est dans la liste des libs (ÉTAPE 0).
 
@@ -555,8 +555,8 @@ docker compose exec -e PYTHONPATH=/opt/airflow:/opt/airflow/src airflow-worker p
 
 ```
 docker compose up -d                      # ÉTAPE 0
-# (générer + uploader le catalogue : ÉTAPES 1)
-# laisser tourner le simulateur (ÉTAPE 4) dans une fenêtre à part
+# (générer + uploader le catalogue : ÉTAPE #3)
+# laisser tourner le simulateur (ÉTAPE #5) dans une fenêtre à part
 ```
 Puis dans Airflow, allumer + lancer dans CET ordre :
 **catalog_ingestion → streaming_events → aggregation → recommendation → dlq_reprocessing**
@@ -577,7 +577,7 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT (SELECT count
 > `docker compose stop airflow-webserver airflow-worker airflow-scheduler airflow-triggerer`
 > (et rallume-les plus tard avec `docker compose start ...`).
 
-## ÉTAPE 10 (#11) — Cluster Kafka KRaft ✅ (testé)
+## ÉTAPE #11 — Cluster Kafka KRaft ✅ (testé)
 
 Les services Kafka (`kafka-1/2/3`, `kafka-ui`, `kafka-init`) sont dans `docker-compose.yml`.
 **3 pièges classiques** (déjà corrigés dans ce repo — à vérifier si tu repars d'un skeleton) :
@@ -620,7 +620,7 @@ docker compose exec kafka-1 kafka-topics --describe --topic listening_events --b
 > et la variable `KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9094,kafka-3:9096` est dans le compose.
 > Le code de #12→#15 est **déjà écrit et testé** dans le repo.
 
-## ÉTAPE 11 (#12) — Simulateur → Kafka ✅ (testé)
+## ÉTAPE #12 — Simulateur → Kafka ✅ (testé)
 
 > Code dans `src/p2p_simulator/simulator.py` : `_publish_to_kafka()` (clé = `user_id`/`peer_id`),
 > appelé dans `_publish_event` en plus de Redis.
@@ -634,7 +634,7 @@ docker compose exec kafka-1 kafka-run-class kafka.tools.GetOffsetShell --broker-
 ✅ Bon = le total de messages du topic `listening_events` augmente.
 (Ou regarde le topic dans Kafka UI http://localhost:8090.)
 
-## ÉTAPE 12 (#13) — Premier job Spark (console) ✅ (testé)
+## ÉTAPE #13 — Premier job Spark (console) ✅ (testé)
 
 > Fichier `spark_jobs/kafka_console_job.py` — lit `listening_events` et l'affiche.
 
@@ -648,13 +648,13 @@ docker compose exec spark-master /opt/spark/bin/spark-submit \
 > 💡 **Pièges Spark** (déjà gérés) : utiliser le chemin **absolu** `/opt/spark/bin/spark-submit`,
 > et ajouter **`--conf spark.jars.ivy=/tmp/ivy`** (sinon erreur Ivy `.ivy2 No such file`).
 
-## ÉTAPE 13 (#14) — streaming_trends_job (fenêtres 5 min) ✅ (testé)
+## ÉTAPE #14 — streaming_trends_job (fenêtres 5 min) ✅ (testé)
 
 > Fichier `spark_jobs/streaming_trends_job.py` — fenêtres tumbling 5 min → table `realtime_top_tracks`
 > (top 10 par fenêtre, upsert idempotent), checkpoint local `/tmp/chk`.
 
 ```bash
-# 1) produire des événements (cf. ÉTAPE 11)
+# 1) produire des événements (cf. ÉTAPE #12)
 # 2) lancer le job (le trigger availableNow traite l'existant puis s'arrête)
 docker compose exec spark-master bash -c '
 rm -rf /tmp/chk/streaming_trends
@@ -665,7 +665,7 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT count(*), cou
 ```
 ✅ Bon = `realtime_top_tracks` se remplit (≈ 10 lignes par fenêtre de 5 min).
 
-## ÉTAPE 14 (#15) — Watermarking + late events ✅ (testé)
+## ÉTAPE #15 — Watermarking + late events ✅ (testé)
 
 > Même fichier : `withWatermark("event_time", "10 minutes")` borne l'état ; les events trop en
 > retard (>10 min) sont routés vers le topic Kafka `late_listening_events` (pour le DAG #20).
@@ -688,7 +688,7 @@ docker compose exec kafka-1 kafka-run-class kafka.tools.GetOffsetShell --broker-
 ```
 ✅ Bon = le topic `late_listening_events` reçoit les events en retard (≈ 50).
 
-## ÉTAPE 15+ (#16 → #20) — À CODER (pas encore fait)
+## ÉTAPE #16+ (#16 → #20) — À CODER (pas encore fait)
 
 - **#16** — Exactly-once bout-en-bout (checkpoints + idempotence Kafka/Spark).
 - **#17** — `streaming_enrichment_job` (jointure stream-static catalogue).
