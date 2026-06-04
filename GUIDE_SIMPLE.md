@@ -688,12 +688,72 @@ docker compose exec kafka-1 kafka-run-class kafka.tools.GetOffsetShell --broker-
 ```
 ✅ Bon = le topic `late_listening_events` reçoit les events en retard (≈ 50).
 
-## ÉTAPE #16+ (#16 → #20) — À CODER (pas encore fait)
+## ÉTAPE #16 — Exactly-once ✅ (testé)
 
-- **#16** — Exactly-once bout-en-bout (checkpoints + idempotence Kafka/Spark).
-- **#17** — `streaming_enrichment_job` (jointure stream-static catalogue).
-- **#18** — `fraud_detection_job` (stateful, détection bots/free-riders).
-- **#19** — DAG `reconciliation_pipeline` (pont batch ↔ streaming).
-- **#20** — DAG `late_events_reprocessing` (consomme `late_listening_events`).
+> Pas un nouveau fichier : c'est une **propriété** garantie par `streaming_trends_job` (#14) =
+> checkpoint Spark + upsert idempotent `ON CONFLICT`. Rejouer les mêmes données ne crée pas de doublon.
 
-➡️ Dis-moi **« fais l'issue #16 »** (etc.) et je l'écris + la teste avant de l'ajouter ici.
+```bash
+# compter, rejouer TOUT (checkpoint effacé), recompter → lignes == clés uniques (0 doublon)
+docker compose exec postgres psql -U spotify -d spotify -c "SELECT count(*) FROM realtime_top_tracks;"
+docker compose exec spark-master bash -c 'rm -rf /tmp/chk/streaming_trends; /opt/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/ivy --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.1 /opt/spark-jobs/streaming_trends_job.py'
+docker compose exec postgres psql -U spotify -d spotify -c "SELECT count(*) AS rows, count(DISTINCT (window_start, track_id)) AS uniq FROM realtime_top_tracks;"
+```
+✅ Bon = `rows == uniq` (aucun doublon malgré le rejeu).
+
+## ÉTAPE #17 — streaming_enrichment_job ✅ (testé)
+
+> `spark_jobs/streaming_enrichment_job.py` — jointure stream-static avec le catalogue
+> (`tracks`) → ajoute `track_title` / `artist_id` / `genre` → republie dans le topic `enriched_events`.
+
+```bash
+docker compose exec spark-master bash -c 'rm -rf /tmp/chk/enrichment; /opt/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/ivy --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.1 /opt/spark-jobs/streaming_enrichment_job.py'
+docker compose exec kafka-1 kafka-run-class kafka.tools.GetOffsetShell --broker-list kafka-1:9092 --topic enriched_events
+```
+✅ Bon = le topic `enriched_events` se remplit (messages avec `track_title`/`artist_id`).
+
+## ÉTAPE #18 — fraud_detection_job ✅ (testé)
+
+> `spark_jobs/fraud_detection_job.py` — agrégation fenêtrée (1 min/user) → détecte
+> `bot_stream` (≥5 écoutes <5 s) et `burst_listen` (≥30 écoutes/min) → table `fraud_detections`.
+
+```bash
+# injecter un bot (1 user, 60 écoutes courtes) pour le test
+docker compose exec airflow-worker python -c "
+import os, uuid; os.environ.setdefault('KAFKA_BOOTSTRAP','kafka-1:9092,kafka-2:9094,kafka-3:9096')
+from p2p_simulator.simulator import P2PSimulator
+sim=P2PSimulator(n_peers=4, events_per_second=100); bot=str(uuid.uuid4())
+for _ in range(60):
+    e=sim._generate_listening_event(); e['user_id']=bot; e['duration_ms']=1500; e['completed']=False
+    sim._publish_event('listening', e)
+sim.kafka.flush(10); print('bot', bot)
+"
+docker compose exec spark-master bash -c 'rm -rf /tmp/chk/fraud; /opt/spark/bin/spark-submit --conf spark.jars.ivy=/tmp/ivy --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.1 /opt/spark-jobs/fraud_detection_job.py'
+docker compose exec postgres psql -U spotify -d spotify -c "SELECT fraud_type, count(*) FROM fraud_detections GROUP BY fraud_type;"
+```
+✅ Bon = au moins 1 ligne `bot_stream` dans `fraud_detections`.
+
+## ÉTAPE #19 — DAG reconciliation_pipeline ✅ (testé)
+
+> `dags/reconciliation_pipeline.py` — compare le total batch (`daily_streams`) et streaming
+> (`realtime_top_tracks`) et logue les écarts.
+
+⌨️ Airflow → lance **reconciliation_pipeline** (ou `airflow dags test reconciliation_pipeline`).
+✅ Bon = vert + log "Réconciliation : {batch_total, streaming_total, diverging_tracks}".
+
+## ÉTAPE #20 — DAG late_events_reprocessing ✅ (testé)
+
+> `dags/late_events_reprocessing.py` — consomme le topic `late_listening_events` (alimenté par #15)
+> et réinjecte les events dans `listening_events` (ON CONFLICT DO NOTHING).
+
+⌨️ Airflow → lance **late_events_reprocessing**.
+✅ Bon = vert + log "N late events réinjectés dans listening_events".
+
+🎉 **Phase 2 (#11 → #20) terminée et testée.**
+
+---
+
+# 🛠️ PHASE 3 — (issues #21 → #25) — pas encore commencée
+
+> Inter-groupes (data contracts, fédération de catalogue, P2P cross-group, Top 50 global, chaos test).
+> ➡️ Dis-moi **« fais l'issue #21 »** quand tu veux attaquer la Phase 3.
