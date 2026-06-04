@@ -13,14 +13,6 @@ Lancement :
         --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,\\
                    org.postgresql:postgresql:42.7.1 \\
         spark_jobs/streaming_trends_job.py
-
-TODO :
-    [ ] Implémenter la lecture du topic Kafka avec readStream
-    [ ] Désérialiser les messages JSON avec le bon schéma
-    [ ] Implémenter les fenêtres tumbling de 5 minutes
-    [ ] Implémenter les sliding windows pour les genres (15 min / 5 min)
-    [ ] Configurer le checkpoint sur MinIO
-    [ ] Écrire les résultats dans PostgreSQL et Redis
 """
 
 import os
@@ -35,16 +27,18 @@ from pyspark.sql.types import (
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP",  "kafka-1:9092")
+KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP",  "kafka-1:9092,kafka-2:9094,kafka-3:9096")
 KAFKA_TOPIC      = "listening_events"
 CHECKPOINT_PATH  = "s3a://spotify-checkpoints/streaming_trends"
 POSTGRES_URL     = os.getenv("SPOTIFY_POSTGRES_URL",
                              "jdbc:postgresql://postgres:5432/spotify")
 POSTGRES_PROPS   = {
-    "user":   "spotify",
+    "user":     "spotify",
     "password": "spotify",
-    "driver": "org.postgresql.Driver",
+    "driver":   "org.postgresql.Driver",
 }
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 # ─────────────────────────────────────────────────────────────
 # SCHÉMA DES ÉVÉNEMENTS D'ÉCOUTE
@@ -71,8 +65,6 @@ LISTENING_EVENT_SCHEMA = StructType([
 def create_spark_session() -> SparkSession:
     """
     Crée et configure la SparkSession avec les dépendances nécessaires.
-
-    TODO : vérifier que les packages kafka et postgresql sont disponibles
     """
     return (
         SparkSession.builder
@@ -211,19 +203,105 @@ def route_late_events(events_df):
 
 def compute_genre_listeners_sliding(events_df, catalog_df):
     """
-    Listeners uniques par genre en sliding window (15 min glissant toutes les 5 min).
+    #17 — Listeners uniques par genre en sliding window (15 min glissant toutes les 5 min).
 
-    TODO :
-        1. Joindre events_df avec catalog_df (stream-static join sur track_id)
-           pour récupérer le genre du morceau
-        2. groupBy(window("event_time", "15 minutes", "5 minutes"), "genre")
-        3. agg(countDistinct("user_id").alias("unique_listeners"))
-        4. Écrire dans Redis (clé "genre_listeners:live") via foreachBatch
-           Utiliser redis-py dans le batch
-
-    Hint : charger le catalogue PostgreSQL comme DataFrame statique avec spark.read.jdbc()
+    1. Jointure stream-static : events_df ⋈ catalog_df sur track_id → récupère le genre
+    2. groupBy(window("event_time", "15 minutes", "5 minutes"), "genre")
+    3. agg(approx_count_distinct("user_id").alias("unique_listeners"))
+    4. Écriture dans Redis clé "genre_listeners:live" via foreachBatch
     """
-    raise NotImplementedError("TODO : implémenter compute_genre_listeners_sliding()")
+
+    # ── 1. Stream-static join : on enrichit chaque event avec le genre du morceau ──
+    # catalog_df est un DataFrame statique (pas de withWatermark côté statique).
+    # F.broadcast() force la copie du catalogue dans chaque executor → pas de shuffle.
+    catalog_slim = catalog_df.select(
+        F.col("id").alias("track_id"),
+        F.col("genre"),
+    )
+
+    enriched = (
+        events_df
+        .join(F.broadcast(catalog_slim), on="track_id", how="left")
+        # Si le genre est inconnu (track non présente dans le catalogue) → "unknown"
+        .withColumn("genre", F.coalesce(F.col("genre"), F.lit("unknown")))
+    )
+
+    # ── 2 & 3. Sliding window 15 min / slide 5 min + watermark ─────────────────────
+    windowed = (
+        enriched
+        .withWatermark("event_time", "10 minutes")
+        .groupBy(
+            F.window("event_time", "15 minutes", "5 minutes"),
+            "genre",
+        )
+        .agg(
+            F.approx_count_distinct("user_id").alias("unique_listeners"),
+            F.count("*").alias("play_count"),
+        )
+    )
+
+    # ── 4. Écriture dans Redis via foreachBatch ─────────────────────────────────────
+    def write_genre_batch(batch_df, batch_id):
+        if batch_df.rdd.isEmpty():
+            return
+
+        # Aplatir la fenêtre pour avoir des colonnes lisibles
+        flat = batch_df.select(
+            F.col("window.start").alias("window_start"),
+            F.col("window.end").alias("window_end"),
+            "genre",
+            "unique_listeners",
+            "play_count",
+        )
+
+        # Collecter côté driver (le catalogue de genres est petit)
+        rows = flat.collect()
+
+        import redis, json
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+        # On regroupe par fenêtre pour écrire une clé par fenêtre + la clé "live" courante
+        from collections import defaultdict
+        by_window = defaultdict(list)
+        for row in rows:
+            key = row["window_start"].strftime("%Y%m%dT%H%M")
+            by_window[key].append({
+                "genre":            row["genre"],
+                "unique_listeners": row["unique_listeners"],
+                "play_count":       row["play_count"],
+            })
+
+        pipe = r.pipeline()
+        for window_key, genres in by_window.items():
+            # Trier par listeners décroissants
+            genres_sorted = sorted(genres, key=lambda x: x["unique_listeners"], reverse=True)
+            redis_key = f"genre_listeners:{window_key}"
+            pipe.set(redis_key, json.dumps(genres_sorted), ex=3600)  # TTL 1h
+
+        # Clé "live" = la fenêtre la plus récente (utile pour le dashboard)
+        if by_window:
+            latest_key = max(by_window.keys())
+            pipe.set(
+                "genre_listeners:live",
+                json.dumps(sorted(by_window[latest_key],
+                                  key=lambda x: x["unique_listeners"], reverse=True)),
+                ex=600,  # TTL 10 min
+            )
+
+        pipe.execute()
+        print(f"[batch {batch_id}] genre_listeners → Redis OK "
+              f"({len(rows)} lignes, {len(by_window)} fenêtres)")
+
+    checkpoint = os.getenv("CHECKPOINT_DIR_GENRES", "/tmp/chk/genre_listeners")
+    writer = (
+        windowed.writeStream
+        .outputMode("update")
+        .foreachBatch(write_genre_batch)
+        .option("checkpointLocation", checkpoint)
+    )
+    if os.getenv("SPARK_CONTINUOUS") != "1":
+        writer = writer.trigger(availableNow=True)
+    return writer.start()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -241,15 +319,17 @@ def main():
     # Lecture Kafka
     events_df = read_kafka_stream(spark)
 
-    # Chargement du catalogue (jointure statique — Phase 2, seq 2.3)
-    # catalog_df = spark.read.jdbc(POSTGRES_URL, "tracks", properties=POSTGRES_PROPS)
+    # Chargement du catalogue (jointure statique — #17)
+    # Mis en cache : chargé une fois, réutilisé dans chaque micro-batch
+    catalog_df = spark.read.jdbc(POSTGRES_URL, "tracks", properties=POSTGRES_PROPS).cache()
+    print(f"Catalogue chargé : {catalog_df.count()} pistes")
 
     # Agrégations + routage des late events
     queries = [
         compute_top_tracks_tumbling(events_df),
         route_late_events(events_df),
+        compute_genre_listeners_sliding(events_df, catalog_df),   # ← #17
     ]
-    # query_genres = compute_genre_listeners_sliding(events_df, catalog_df)
 
     for q in queries:
         q.awaitTermination()
