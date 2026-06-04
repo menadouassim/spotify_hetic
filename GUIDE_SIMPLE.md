@@ -569,7 +569,6 @@ docker compose exec postgres psql -U spotify -d spotify -c "SELECT (SELECT count
 🎉 **Phase 1 (#1 → #10) terminée et testée.**
 
 ---
-
 # 🛠️ PHASE 2 — PROCÉDURE COMPLÈTE (Kafka + Spark, issues #11 → #20)
 
 > ⚠️ **Mémoire** : Kafka (3 brokers) + Spark + Airflow, c'est lourd (~6–8 Go RAM Docker).

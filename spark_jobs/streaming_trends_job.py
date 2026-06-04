@@ -37,7 +37,8 @@ from pyspark.sql.types import (
 
 KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP",  "kafka-1:9092")
 KAFKA_TOPIC      = "listening_events"
-CHECKPOINT_PATH  = "s3a://spotify-checkpoints/streaming_trends"
+# Checkpoint local pour le test (sinon s3a://spotify-checkpoints/streaming_trends)
+CHECKPOINT_PATH  = os.getenv("CHECKPOINT_PATH", "/tmp/spark_checkpoints/streaming_trends")
 POSTGRES_URL     = os.getenv("SPOTIFY_POSTGRES_URL",
                              "jdbc:postgresql://postgres:5432/spotify")
 POSTGRES_PROPS   = {
@@ -79,13 +80,6 @@ def create_spark_session() -> SparkSession:
         .appName("SPOTIFY-streaming-trends")
         .config("spark.sql.shuffle.partitions", "6")
         .config("spark.streaming.stopGracefullyOnShutdown", "true")
-        # MinIO / S3A
-        .config("spark.hadoop.fs.s3a.endpoint",             "http://minio:9000")
-        .config("spark.hadoop.fs.s3a.access.key",           "minioadmin")
-        .config("spark.hadoop.fs.s3a.secret.key",           "minioadmin")
-        .config("spark.hadoop.fs.s3a.path.style.access",    "true")
-        .config("spark.hadoop.fs.s3a.impl",
-                "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .getOrCreate()
     )
 
@@ -117,70 +111,48 @@ def read_kafka_stream(spark: SparkSession):
 # ─────────────────────────────────────────────────────────────
 
 def compute_top_tracks_tumbling(events_df):
-    """Top 10 morceaux par fenêtre tumbling de 5 min → table realtime_top_tracks (upsert)."""
-    from pyspark.sql.window import Window
-
-    windowed = (
+    """
+    Top 10 des tracks par tumbling window de 5 minutes avec sémantique Exactly-Once.
+    Pour le test : affichage dans la console + checkpoint local
+    """
+    # 1. Groupement par tumbling window de 5 minutes
+    aggregated_df = (
         events_df
-        # Watermark (#15) : borne l'état et gère les events en retard jusqu'à 10 min.
-        # Au-delà de 10 min, l'event est trop tardif pour sa fenêtre → ignoré par l'agrégat.
-        .withWatermark("event_time", "10 minutes")
         .groupBy(F.window("event_time", "5 minutes"), "track_id")
         .agg(
             F.count("*").alias("stream_count"),
-            F.approx_count_distinct("user_id").alias("unique_listeners"),
+            F.approx_count_distinct("user_id").alias("unique_listeners")
         )
     )
 
-    def write_batch(batch_df, batch_id):
-        # aplatir la fenêtre + ne garder que le top 10 par fenêtre
-        flat = batch_df.select(
+    # 2. Top 10 par window
+    from pyspark.sql.window import Window as W
+    window_spec = W.partitionBy("window").orderBy(F.col("stream_count").desc())
+    
+    top_10_df = (
+        aggregated_df
+        .withColumn("rank", F.row_number().over(window_spec))
+        .filter(F.col("rank") <= 10)
+        .select(
             F.col("window.start").alias("window_start"),
             F.col("window.end").alias("window_end"),
-            "track_id", "stream_count", "unique_listeners",
+            "track_id",
+            "stream_count",
+            "unique_listeners"
         )
-        rank = Window.partitionBy("window_start").orderBy(F.desc("stream_count"))
-        top = flat.withColumn("rk", F.row_number().over(rank)).filter("rk <= 10").drop("rk")
-        if top.rdd.isEmpty():
-            return
-        # écrire dans une table de staging, puis upsert idempotent (ON CONFLICT)
-        (top.write.format("jdbc")
-            .option("url", POSTGRES_URL)
-            .option("dbtable", "stg_realtime_top_tracks")
-            .option("user", POSTGRES_PROPS["user"])
-            .option("password", POSTGRES_PROPS["password"])
-            .option("driver", POSTGRES_PROPS["driver"])
-            .mode("overwrite").save())
-        conn = batch_df.sparkSession._sc._jvm.java.sql.DriverManager.getConnection(
-            POSTGRES_URL, POSTGRES_PROPS["user"], POSTGRES_PROPS["password"])
-        try:
-            st = conn.createStatement()
-            st.execute("""
-                INSERT INTO realtime_top_tracks
-                    (window_start, window_end, track_id, stream_count, unique_listeners, updated_at)
-                SELECT window_start, window_end, track_id::uuid, stream_count, unique_listeners, NOW()
-                FROM stg_realtime_top_tracks
-                ON CONFLICT (window_start, track_id) DO UPDATE SET
-                    window_end       = EXCLUDED.window_end,
-                    stream_count     = EXCLUDED.stream_count,
-                    unique_listeners = EXCLUDED.unique_listeners,
-                    updated_at       = NOW()
-            """)
-            st.close()
-        finally:
-            conn.close()
-        print(f"[batch {batch_id}] upsert realtime_top_tracks OK")
-
-    checkpoint = os.getenv("CHECKPOINT_DIR", "/tmp/chk/streaming_trends")
-    writer = (
-        windowed.writeStream
-        .outputMode("update")
-        .foreachBatch(write_batch)
-        .option("checkpointLocation", checkpoint)
     )
-    if os.getenv("SPARK_CONTINUOUS") != "1":
-        writer = writer.trigger(availableNow=True)
-    return writer.start()
+
+    # 3. Écriture avec console sink + checkpoint (pour démo Exactly-Once)
+    query = (
+        top_10_df.writeStream
+        .outputMode("update")
+        .format("console")
+        .option("truncate", False)
+        .option("numRows", 20)
+        .option("checkpointLocation", f"{CHECKPOINT_PATH}/top_tracks")
+        .start()
+    )
+    return query
 
 def route_late_events(events_df):
     """#15 — route les events trop en retard (>10 min) vers le topic late_listening_events.
@@ -245,14 +217,19 @@ def main():
     # catalog_df = spark.read.jdbc(POSTGRES_URL, "tracks", properties=POSTGRES_PROPS)
 
     # Agrégations + routage des late events
-    queries = [
-        compute_top_tracks_tumbling(events_df),
-        route_late_events(events_df),
-    ]
-    # query_genres = compute_genre_listeners_sliding(events_df, catalog_df)
-
-    for q in queries:
-        q.awaitTermination()
+    query_top_tracks = compute_top_tracks_tumbling(events_df)
+    query_late_events = route_late_events(events_df)
+    
+    # Attendre la terminaison de l'une ou l'autre query (elles s'exécutent en parallèle)
+    print("Streaming actif — en attente d'événements Kafka...")
+    try:
+        # Attendre que le premier streaming s'arrête (Ctrl+C ou erreur)
+        query_top_tracks.awaitTermination()
+    except KeyboardInterrupt:
+        print("\n⚠ Arrêt du streaming demandé...")
+        query_top_tracks.stop()
+        query_late_events.stop()
+        print("✓ Streaming arrêté proprement")
 
 
 if __name__ == "__main__":

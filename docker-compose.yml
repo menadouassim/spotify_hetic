@@ -95,7 +95,7 @@ services:
       mc mb local/labels-raw || true;
       echo 'Buckets MinIO initialisés';
       "
-
+    
   # ─────────────────────────────────────────
   # AIRFLOW
   # ─────────────────────────────────────────

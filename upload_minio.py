@@ -8,7 +8,9 @@ s3 = boto3.client(
     aws_access_key_id="minioadmin",
     aws_secret_access_key="minioadmin"
 )
+def function():
+    for f in glob.glob("data/labels/*.json"):
+        s3.upload_file(f, "labels-raw", os.path.basename(f))
+        print("Uploadé:", f)
 
-for f in glob.glob("data/labels/*.json"):
-    s3.upload_file(f, "labels-raw", os.path.basename(f))
-    print("Uploadé:", f)
+function()

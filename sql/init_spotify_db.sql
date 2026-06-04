@@ -204,3 +204,6 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO spotify;
 COMMENT ON TABLE listening_events IS 'Événements d''écoute générés par le simulateur P2P. Partitionnable par timestamp pour la parallélisation.';
 COMMENT ON TABLE dead_letter_events IS 'Dead Letter Queue — événements défectueux isolés pour audit et retraitement.';
 COMMENT ON TABLE realtime_top_tracks IS 'Alimentée par Spark Structured Streaming (job streaming_trends_job). Fenêtres de 5 min.';
+
+ALTER TABLE realtime_top_tracks 
+ADD CONSTRAINT unique_window_track UNIQUE (window_start, window_end, track_id);
