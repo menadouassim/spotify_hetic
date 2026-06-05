@@ -143,6 +143,9 @@ def compute_top_tracks_tumbling(events_df):
         top = flat.withColumn("rk", F.row_number().over(rank)).filter("rk <= 10").drop("rk")
         if top.rdd.isEmpty():
             return
+        # #16 — Exactly-once vers le sink : checkpoint Spark (offsets Kafka rejoués au besoin)
+        #       + upsert idempotent ON CONFLICT (window_start, track_id). Rejouer les mêmes
+        #       données ne crée jamais de doublon → livraison effectivement exactly-once.
         # écrire dans une table de staging, puis upsert idempotent (ON CONFLICT)
         (top.write.format("jdbc")
             .option("url", POSTGRES_URL)
